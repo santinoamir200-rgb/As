@@ -35,10 +35,10 @@ jobs:
 
       - name: Cache del toolchain ps3dev
         id: cache-ps3dev
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /usr/local/ps3dev
-          key: ps3dev-ubuntu2204-v1
+          key: ps3dev-ubuntu2204-v2
 
       - name: Construir toolchain ps3dev (solo si no hay caché)
         if: steps.cache-ps3dev.outputs.cache-hit != 'true'
@@ -49,6 +49,41 @@ jobs:
           git clone --depth 1 https://github.com/ps3dev/ps3toolchain.git
           cd ps3toolchain
           ./toolchain.sh
+
+      - name: Construir librerías de PS3 (zlib, libpng, libjpeg)
+        if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
+          PORT="$PS3DEV/portlibs/ppu"
+          git clone --depth 1 https://github.com/ps3dev/ps3libraries.git
+          cd ps3libraries
+          echo "--- scripts disponibles ---"
+          ls scripts depends 2>/dev/null | head -100
+          mkdir -p build && cd build
+          # mismo método que libraries.sh: scripts ejecutados desde build/, en orden
+          for pat in zlib png jpeg; do
+            for f in $(ls ../scripts/*.sh ../depends/*.sh 2>/dev/null | grep -i "$pat" | sort); do
+              echo "=== $f ==="
+              bash "$f"
+            done
+          done
+          echo "--- resultado en $PORT/lib ---"
+          ls "$PORT/lib" "$PORT/include" | head -60
+          for l in libz.a libpng.a libjpeg.a; do
+            if [ ! -f "$PORT/lib/$l" ] && ! ls "$PORT/lib"/${l%.a}*.a >/dev/null 2>&1; then
+              echo "ERROR: falta $l en $PORT/lib"; exit 1
+            fi
+          done
+          for h in zlib.h png.h jpeglib.h; do
+            [ -f "$PORT/include/$h" ] || { echo "ERROR: falta $h en $PORT/include"; exit 1; }
+          done
+
+      - name: Guardar caché del toolchain (aunque falle lo que sigue)
+        if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /usr/local/ps3dev
+          key: ps3dev-ubuntu2204-v2
 
       - name: Instalar Cg Toolkit (libCg para cgcomp)
         run: |
