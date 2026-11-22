@@ -141,8 +141,18 @@ jobs:
             sudo apt-get install -y nvidia-cg-toolkit
           fi
           find / -name 'libCg.so*' 2>/dev/null || true
-          LIB=$(find /usr /opt -name 'libCg.so' 2>/dev/null | head -n 1)
-          [ -n "$LIB" ] || { echo "ERROR: no hay libCg.so"; exit 1; }
+          # El tgz de NVIDIA trae OTRA libCg.so en /usr/local/Cg/examples/Trace (traceCg, un
+          # wrapper que loguea todas las llamadas y se carga a si mismo). Hay que excluirla:
+          # la real esta en usr/lib64 (o usr/lib en 32 bits).
+          find /usr /opt -name 'libCg.so*' -not -path '*examples*' -not -path '*Trace*' 2>/dev/null || true
+          LIB=""
+          for c in /usr/lib64/libCg.so /usr/lib/libCg.so /usr/lib/x86_64-linux-gnu/libCg.so /usr/lib/i386-linux-gnu/libCg.so; do
+            [ -f "$c" ] && { LIB="$c"; break; }
+          done
+          [ -n "$LIB" ] || LIB=$(find /usr /opt -name 'libCg.so' -not -path '*examples*' -not -path '*Trace*' 2>/dev/null | head -n 1)
+          [ -n "$LIB" ] || { echo "ERROR: no hay libCg.so real"; exit 1; }
+          echo "Usando libCg real: $LIB"
+          if strings "$LIB" | grep -qi "traceCg"; then echo "ERROR: $LIB es la libreria Trace, no la real"; exit 1; fi
           # copiar libCg.so a las rutas estandar donde dlopen busca si o si
           for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib32 /usr/local/lib; do
             if [ -d "$d" ] && ! [ "$LIB" -ef "$d/libCg.so" ]; then sudo cp -f "$LIB" "$d/libCg.so" || true; fi
