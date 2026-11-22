@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y autoconf automake bison flex gcc g++ libelf-dev make \
             texinfo libncurses5-dev patch python3 python-is-python3 subversion wget \
             zlib1g-dev libtool libtool-bin bzip2 libgmp3-dev pkg-config libssl-dev \
-            cmake ninja-build git zip unzip
+            cmake ninja-build git zip unzip imagemagick
 
       - name: Cache del toolchain ps3dev
         id: cache-ps3dev
@@ -50,34 +50,70 @@ jobs:
           cd ps3toolchain
           ./toolchain.sh
 
-      - name: Instalar Cg Toolkit
+      - name: Instalar Cg Toolkit (libCg para cgcomp)
         run: |
-          wget -q https://developer.download.nvidia.com/cg/Cg_3.1/Cg-3.1_April2012_x86_64.tgz
-          sudo tar -xzf Cg-3.1_April2012_x86_64.tgz -C /
-          echo "/usr/lib64" | sudo tee /etc/ld.so.conf.d/cg.conf
+          set -x
+          CGCOMP="$PS3DEV/bin/cgcomp"
+          file "$CGCOMP" || true
+          sudo apt-get install -y file strace || true
+          # cgcomp hace dlopen("libCg.so"): hay que tener la libCg de la MISMA arquitectura (32 o 64 bits)
+          if file "$CGCOMP" | grep -q "32-bit"; then
+            ARCH=ia32; TGZ=Cg-3.1_April2012_x86.tgz; LIBDIR=/usr/lib32
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install -y libc6:i386 libstdc++6:i386 || true
+          else
+            ARCH=x86_64; TGZ=Cg-3.1_April2012_x86_64.tgz; LIBDIR=/usr/lib64
+          fi
+          wget --tries=3 -O cg.tgz "https://developer.download.nvidia.com/cg/Cg_3.1/$TGZ" || true
+          if tar -tzf cg.tgz >/dev/null 2>&1; then
+            sudo tar -xzf cg.tgz -C /
+          else
+            echo "Fallo la descarga de NVIDIA; pruebo con apt"
+            sudo add-apt-repository -y multiverse
+            sudo apt-get update
+            sudo apt-get install -y nvidia-cg-toolkit
+          fi
+          find / -name 'libCg.so*' 2>/dev/null
+          # copiar libCg.so a las rutas estándar donde dlopen busca sí o sí
+          LIB=$(find /usr /opt -name 'libCg.so' 2>/dev/null | head -n 1)
+          [ -n "$LIB" ] || { echo "ERROR: no hay libCg.so"; exit 1; }
+          for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib32 /usr/local/lib; do
+            [ -d "$d" ] && sudo cp -f "$LIB" "$d/libCg.so" || true
+          done
           sudo ldconfig
-          echo "LD_LIBRARY_PATH=/usr/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-          ls /usr/lib64 | grep -i libCg
+          echo "LD_LIBRARY_PATH=$(dirname "$LIB"):/usr/lib:/usr/lib64:/usr/lib32:/usr/local/lib" >> $GITHUB_ENV
+          ldd "$LIB" || true
+          # prueba real: compilar un shader antes de empezar el build
+          mkdir -p /tmp/cgtest
+          echo "--- prueba de cgcomp ---"
+          export LD_LIBRARY_PATH="$(dirname "$LIB"):/usr/lib:/usr/lib64:/usr/lib32:$LD_LIBRARY_PATH"
+          F=$(find . -name 'ps3gl_fp_tex.fcg' | head -n 1)
+          "$CGCOMP" -f "$F" /tmp/cgtest/t.fpo || {
+            echo "cgcomp sigue fallando; trazando dlopen:"
+            strace -f -e trace=openat "$CGCOMP" -f "$F" /tmp/cgtest/t.fpo 2>&1 | grep -i -E "libcg|ENOENT.*cg" || true
+            exit 1
+          }
+          ls -l /tmp/cgtest
+
+      - name: Diagnostico del toolchain
+        run: |
+          export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
+          ls "$PS3DEV/bin" | head -50
+          which powerpc64-ps3-elf-gcc cgcomp make_self_npdrm sfo.py pkg.py fself.py || true
 
       - name: Compilar el juego
         run: |
+          chmod +x ./*.sh
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
-          export LD_LIBRARY_PATH="/usr/lib64:$LD_LIBRARY_PATH"
-          cmake -S . -B build-ps3 -G Ninja
-          ninja -C build-ps3 2>&1 | tee build-ps3/build.log
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          ./build_ps3.sh clean 2>&1 | tee build.log
 
       - name: Empaquetar (.self y .pkg)
         run: |
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
-          cd build-ps3
-          ELF=$(find . -maxdepth 2 -name "*.elf" | head -n 1)
-          echo "ELF: $ELF"
-          if [ -n "$ELF" ]; then
-            make_self "$ELF" "${ELF%.elf}.self" || fself.py "$ELF" "${ELF%.elf}.self"
-          fi
-          # Si el proyecto trae su propio script de .pkg, usalo:
-          if [ -f ../ps3pkg.py ]; then python3 ../ps3pkg.py . || true; fi
-          ls -la
+          ./package_ps3.sh 2>&1 | tee package.log
+          ls -la build-ps3/package || true
 
       - name: Subir resultado
         if: always()
@@ -85,8 +121,11 @@ jobs:
         with:
           name: resultado-ps3
           path: |
-            build-ps3/*.self
-            build-ps3/*.pkg
-            build-ps3/*.elf
-            build-ps3/build.log
+            build-ps3/pvz_ps3.elf
+            build-ps3/package/*.self
+            build-ps3/package/*.pkg
+            build.log
+            build-ps3/ps3gl_shaders/*
+            build-ps3/.ninja_log
+            package.log
           if-no-files-found: warn
