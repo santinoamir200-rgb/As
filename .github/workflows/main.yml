@@ -186,8 +186,20 @@ jobs:
           chmod +x ./*.sh
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          # -w apaga TODOS los warnings (el log se llenaba de "#pragma warning(disable:4101)"
+          # y de -Wclass-memaccess, y tapaba el error real). Solo quedan los errores.
+          export CFLAGS="-w" CXXFLAGS="-w"
           # pipefail viene de "shell: bash": si build_ps3.sh falla, este paso falla.
-          ./build_ps3.sh clean 2>&1 | tee build.log
+          # Todo el log va a build.log (se sube en el artefacto). En pantalla solo se
+          # imprimen los errores, justo al final de ESTE paso, para que sean lo ultimo que se ve.
+          if ! ./build_ps3.sh clean > build.log 2>&1; then
+            echo "################ BUILD FALLO: PRIMEROS ERRORES ################"
+            grep -n -m 12 -B2 -A6 -E " error:|fatal error|undefined reference|FAILED:|ld returned|No such file" build.log || true
+            echo "################ ULTIMAS 25 LINEAS ################"
+            tail -n 25 build.log
+            exit 1
+          fi
+          tail -n 5 build.log
           test -f build-ps3/pvz_ps3.elf
 
       - name: Empaquetar (.self y .pkg)
@@ -203,7 +215,7 @@ jobs:
           for f in build.log package.log; do
             [ -f "$f" ] || continue
             echo "=============== $f ==============="
-            grep -n -i -m 20 -E "error|fatal|undefined reference|FAILED:|No such file|not found" "$f" || tail -n 40 "$f"
+            grep -n -m 25 -A4 -E " error:|fatal error|undefined reference|FAILED:|ld returned|No such file|Error [0-9]" "$f" || tail -n 40 "$f"
           done
 
       - name: Subir resultado
