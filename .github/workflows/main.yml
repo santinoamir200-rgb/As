@@ -1,0 +1,128 @@
+name: Build PS3
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ps3-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PS3DEV: /usr/local/ps3dev
+  PSL1GHT: /usr/local/ps3dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extraer el proyecto (proyecto.zip)
+        run: |
+          for z in proyecto.zip carpetas.zip pvz-ps3-osk.zip; do
+            if [ -f "$z" ]; then
+              echo "Extrayendo $z"
+              rm -rf /tmp/zipx && mkdir -p /tmp/zipx
+              unzip -oq "$z" -d /tmp/zipx
+              if [ -d /tmp/zipx/tree ]; then
+                cp -a /tmp/zipx/tree/. .
+              else
+                cp -a /tmp/zipx/. .
+              fi
+            fi
+          done
+          ls
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison flex gcc g++ make patch \
+            texinfo libelf-dev libncurses-dev zlib1g-dev libtool libtool-bin \
+            python3 python3-dev python-is-python3 bzip2 xz-utils wget git \
+            libgmp-dev libmpfr-dev libmpc-dev pkg-config libssl-dev cmake \
+            ninja-build imagemagick subversion gettext
+
+      - name: Carpeta del toolchain
+        run: |
+          sudo mkdir -p "$PS3DEV"
+          sudo chown -R "$USER" "$PS3DEV"
+
+      - name: Cache del toolchain
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /usr/local/ps3dev
+          key: ps3dev-v1
+
+      - name: Compilar ps3toolchain (solo la primera vez, ~1 h)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          git clone --depth 1 https://github.com/ps3dev/ps3toolchain.git
+          cd ps3toolchain
+          ./toolchain.sh 2>&1 | tee ../toolchain.log
+
+      - name: Compilar ps3libraries (zlib, libpng, libjpeg...)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          git clone --depth 1 https://github.com/ps3dev/ps3libraries.git
+          cd ps3libraries
+          ./libraries.sh 2>&1 | tee ../libraries.log
+
+      - name: Guardar cache del toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /usr/local/ps3dev
+          key: ps3dev-v1
+
+      - name: Diagnostico del toolchain
+        continue-on-error: true
+        run: |
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PATH"
+          {
+            for t in cmake ninja python3 cgcomp sprxlinker fself.py make_self_npdrm sfo.py pkg.py ppu-gcc ppu-strip; do
+              if command -v "$t" >/dev/null 2>&1; then echo "OK      $t"; else echo "FALTA   $t"; fi
+            done
+            echo "--- portlibs/ppu/lib"
+            ls "$PS3DEV/portlibs/ppu/lib" 2>&1 | head -50
+            echo "--- ls PS3DEV/bin"
+            ls "$PS3DEV/bin" 2>&1 | head -80
+            echo "--- proyecto"
+            ls
+          } 2>&1 | tee diag.log
+
+      - name: Compilar el juego
+        run: |
+          set -o pipefail
+          chmod +x build_ps3.sh package_ps3.sh
+          ./build_ps3.sh 2>&1 | tee build.log
+
+      - name: Empaquetar (.self y .pkg)
+        if: success()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./package_ps3.sh 2>&1 | tee package.log
+
+      - name: Subir resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-ps3
+          path: |
+            diag.log
+            build.log
+            package.log
+            toolchain.log
+            libraries.log
+            build-ps3/pvz_ps3.elf
+            build-ps3/package/pvz_ps3.self
+            build-ps3/package/pvz_ps3.pkg
+          if-no-files-found: ignore
