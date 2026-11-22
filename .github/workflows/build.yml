@@ -1,1 +1,92 @@
+name: Build PS3
 
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      PS3DEV: /usr/local/ps3dev
+      PSL1GHT: /usr/local/ps3dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extraer el proyecto (proyecto.zip)
+        run: |
+          if [ -f proyecto.zip ]; then
+            echo "Extrayendo proyecto.zip"
+            unzip -o -q proyecto.zip
+            ls
+          else
+            echo "No hay proyecto.zip, uso el repo tal cual"
+          fi
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison flex gcc g++ libelf-dev make \
+            texinfo libncurses5-dev patch python3 python-is-python3 subversion wget \
+            zlib1g-dev libtool libtool-bin bzip2 libgmp3-dev pkg-config libssl-dev \
+            cmake ninja-build git zip unzip
+
+      - name: Cache del toolchain ps3dev
+        id: cache-ps3dev
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/ps3dev
+          key: ps3dev-ubuntu2204-v1
+
+      - name: Construir toolchain ps3dev (solo si no hay caché)
+        if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /usr/local/ps3dev
+          sudo chown -R "$USER" /usr/local/ps3dev
+          export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
+          git clone --depth 1 https://github.com/ps3dev/ps3toolchain.git
+          cd ps3toolchain
+          ./toolchain.sh
+
+      - name: Instalar Cg Toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/cg/Cg_3.1/Cg-3.1_April2012_x86_64.tgz
+          sudo tar -xzf Cg-3.1_April2012_x86_64.tgz -C /
+          echo "/usr/lib64" | sudo tee /etc/ld.so.conf.d/cg.conf
+          sudo ldconfig
+          echo "LD_LIBRARY_PATH=/usr/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          ls /usr/lib64 | grep -i libCg
+
+      - name: Compilar el juego
+        run: |
+          export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
+          export LD_LIBRARY_PATH="/usr/lib64:$LD_LIBRARY_PATH"
+          cmake -S . -B build-ps3 -G Ninja
+          ninja -C build-ps3 2>&1 | tee build-ps3/build.log
+
+      - name: Empaquetar (.self y .pkg)
+        run: |
+          export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
+          cd build-ps3
+          ELF=$(find . -maxdepth 2 -name "*.elf" | head -n 1)
+          echo "ELF: $ELF"
+          if [ -n "$ELF" ]; then
+            make_self "$ELF" "${ELF%.elf}.self" || fself.py "$ELF" "${ELF%.elf}.self"
+          fi
+          # Si el proyecto trae su propio script de .pkg, usalo:
+          if [ -f ../ps3pkg.py ]; then python3 ../ps3pkg.py . || true; fi
+          ls -la
+
+      - name: Subir resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-ps3
+          path: |
+            build-ps3/*.self
+            build-ps3/*.pkg
+            build-ps3/*.elf
+            build-ps3/build.log
+          if-no-files-found: warn
