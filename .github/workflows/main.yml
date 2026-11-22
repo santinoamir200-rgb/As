@@ -193,6 +193,8 @@ jobs:
           # Todo el log va a build.log (se sube en el artefacto). En pantalla solo se
           # imprimen los errores, justo al final de ESTE paso, para que sean lo ultimo que se ve.
           if ! ./build_ps3.sh clean > build.log 2>&1; then
+            echo "################ RESUMEN: TODOS LOS ERRORES (sin repetir) ################"
+            grep -E " error:" build.log | sed -E 's#/home/runner/work/[^/]+/[^/]+/##' | sort -u | head -60 || true
             echo "################ BUILD FALLO: PRIMEROS ERRORES ################"
             grep -n -m 12 -B2 -A6 -E " error:|fatal error|undefined reference|FAILED:|ld returned|No such file" build.log || true
             echo "################ ULTIMAS 25 LINEAS ################"
