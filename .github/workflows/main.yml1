@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Parte 6: arma el .self (para correr desde USB/HDD) y el .pkg (instalable) a partir de
+# build-ps3/pvz_ps3.elf, con las herramientas de ps3toolchain / PSL1GHT.
+#
+# Uso:   ./build_ps3.sh && ./package_ps3.sh
+#        ./package_ps3.sh --with-data /ruta/a/PvZ   (copia main.pak y properties/ al .pkg)
+#
+# SIN PROBAR: no tengo el toolchain. Los nombres de las herramientas y sus flags son los
+# que recuerdo de ppu_rules de PSL1GHT; si alguno no existe en tu instalacion el script
+# se detiene y te dice cual. Revisalos con:  ls $PS3DEV/bin
+set -euo pipefail
+cd "$(dirname "$0")"
+
+export PS3DEV="${PS3DEV:-/usr/local/ps3dev}"
+export PSL1GHT="${PSL1GHT:-$PS3DEV}"
+export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PATH"
+
+TITLE="Plants vs Zombies"
+APPID="PVZPS3001"                              # 9 caracteres, sin guion
+CONTENTID="UP0001-${APPID}_00-0000000000000000" # formato fijo: 36 caracteres
+ELF="build-ps3/pvz_ps3.elf"
+OUT="build-ps3/package"
+DATA_DIR=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--with-data) DATA_DIR="${2:?falta la ruta}"; shift 2 ;;
+		*) echo "opcion desconocida: $1" >&2; exit 1 ;;
+	esac
+done
+
+SEARCH_DIRS="$PS3DEV/bin $PSL1GHT/bin $PSL1GHT/host/bin $PS3DEV/host/bin $PS3DEV/ppu/bin"
+
+find_tool() { # find_tool <nombre...>: imprime la ruta de la primera que exista (PATH o carpetas de PSL1GHT)
+	local n d
+	for n in "$@"; do
+		if command -v "$n" >/dev/null 2>&1; then command -v "$n"; return 0; fi
+		for d in $SEARCH_DIRS; do
+			if [ -x "$d/$n" ]; then echo "$d/$n"; return 0; fi
+		done
+	done
+	return 1
+}
+
+need() { # need <nombre> <alternativa...>: obligatoria; si no existe, aborta
+	find_tool "$@" && return 0
+	echo "ERROR: no encuentro ninguna de estas herramientas: $*" >&2
+	echo "       (buscadas en PATH y en: $SEARCH_DIRS)" >&2
+	exit 1
+}
+
+opt() { # opt <nombre...>: opcional; si no existe imprime vacio y sigue
+	find_tool "$@" || true
+}
+
+[ -f "$ELF" ] || { echo "ERROR: falta $ELF. Corre ./build_ps3.sh primero." >&2; exit 1; }
+
+SPRXLINKER="$(need sprxlinker)"
+FSELF="$(need fself.py fself make_fself)"
+MAKE_SELF_NPDRM="$(need make_self_npdrm)"
+SFO="$(opt sfo.py)"
+PKGTOOL="$(opt pkg.py)"
+PYTHON="$(need python3 python2 python)"
+STRIP="$(need ppu-strip powerpc64-ps3-elf-strip)"
+
+# sfo.xml viene con PSL1GHT; la ruta exacta puede variar segun la version.
+SFOXML=""
+for p in "$PS3DEV/bin/sfo.xml" "$PSL1GHT/bin/sfo.xml" "$PS3DEV/share/sfo.xml"; do
+	[ -f "$p" ] && { SFOXML="$p"; break; }
+done || true
+[ -n "$SFOXML" ] || SFOXML="$(find "$PS3DEV" "$PSL1GHT" -maxdepth 4 -name sfo.xml 2>/dev/null | head -n 1 || true)"
+rm -rf "$OUT"
+mkdir -p "$OUT/pkg/USRDIR"
+
+echo "[1/5] strip + sprxlinker"
+cp "$ELF" "$OUT/pvz_ps3.stripped.elf"
+"$STRIP" "$OUT/pvz_ps3.stripped.elf"
+"$SPRXLINKER" "$OUT/pvz_ps3.stripped.elf"
+
+echo "[2/5] .self (para correr sin instalar)"
+"$PYTHON" "$FSELF" "$OUT/pvz_ps3.stripped.elf" "$OUT/pvz_ps3.self"
+
+echo "[3/5] EBOOT.BIN firmado (para el .pkg)"
+"$MAKE_SELF_NPDRM" "$OUT/pvz_ps3.stripped.elf" "$OUT/pkg/USRDIR/EBOOT.BIN" "$CONTENTID"
+
+HAVE_SFO=0
+echo "[4/5] PARAM.SFO e ICON0.PNG"
+if [ -n "$SFO" ] && [ -n "$SFOXML" ]; then
+	"$PYTHON" "$SFO" --title "$TITLE" --appid "$APPID" -f "$SFOXML" "$OUT/pkg/PARAM.SFO" && HAVE_SFO=1
+else
+	echo "  AVISO: falta sfo.py (${SFO:-no encontrado}) o sfo.xml (${SFOXML:-no encontrado}); sin PARAM.SFO no se puede armar el .pkg."
+fi
+if [ -f icon.png ]; then
+	# El XMB espera 320x176. Si hay ImageMagick lo ajusta; si no, copia tal cual.
+	if command -v convert >/dev/null 2>&1; then
+		convert icon.png -resize 320x176 -background black -gravity center -extent 320x176 "$OUT/pkg/ICON0.PNG"
+	else
+		cp icon.png "$OUT/pkg/ICON0.PNG"
+		echo "  aviso: sin ImageMagick; icon.png se copio sin redimensionar (ideal 320x176)"
+	fi
+else
+	echo "  aviso: no hay icon.png; el .pkg queda sin icono"
+fi
+
+if [ -n "$DATA_DIR" ]; then
+	echo "      copiando datos del juego desde $DATA_DIR"
+	[ -f "$DATA_DIR/main.pak" ] || { echo "ERROR: no hay main.pak en $DATA_DIR" >&2; exit 1; }
+	cp "$DATA_DIR/main.pak" "$OUT/pkg/USRDIR/"
+	[ -d "$DATA_DIR/properties" ] && cp -r "$DATA_DIR/properties" "$OUT/pkg/USRDIR/"
+fi
+
+HAVE_PKG=0
+echo "[5/5] .pkg"
+if [ "$HAVE_SFO" = 1 ] && [ -n "$PKGTOOL" ]; then
+	"$PYTHON" "$PKGTOOL" --contentid "$CONTENTID" "$OUT/pkg/" "$OUT/pvz_ps3.pkg" && HAVE_PKG=1
+else
+	echo "  AVISO: se omite el .pkg (pkg.py: ${PKGTOOL:-no encontrado}, PARAM.SFO: $HAVE_SFO). El .self y el EBOOT.BIN si quedaron."
+fi
+
+echo
+echo "Listo:"
+echo "  $OUT/pvz_ps3.self   (ejecutar sin instalar)"
+[ "$HAVE_PKG" = 1 ] && echo "  $OUT/pvz_ps3.pkg    (instalar desde el XMB / gestor de paquetes)"
+[ -n "$DATA_DIR" ] || echo "Recuerda: main.pak y properties/ van en /dev_usb000/PVZ o junto al EBOOT."
