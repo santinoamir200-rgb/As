@@ -5,10 +5,19 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# bash explicito = "bash -eo pipefail": sin esto, "comando | tee log" devuelve el
+# exit code de tee (0) y un build roto parece exitoso hasta que falla el empaquetado.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       PS3DEV: /usr/local/ps3dev
       PSL1GHT: /usr/local/ps3dev
@@ -31,74 +40,96 @@ jobs:
           sudo apt-get install -y autoconf automake bison flex gcc g++ libelf-dev make \
             texinfo libncurses5-dev patch python3 python-is-python3 subversion wget \
             zlib1g-dev libtool libtool-bin bzip2 libgmp3-dev pkg-config libssl-dev \
-            cmake ninja-build git zip unzip imagemagick
+            cmake ninja-build git zip unzip imagemagick file strace
 
-      - name: Cache del toolchain ps3dev
+      # /usr/local no es escribible por el usuario del runner: se crea y se le da
+      # permiso ANTES de restaurar la cache, si no la restauracion puede fallar sin avisar.
+      - name: Preparar carpeta del toolchain
+        run: |
+          sudo mkdir -p "$PS3DEV"
+          sudo chown -R "$USER" "$PS3DEV"
+
+      # Clave unica por corrida + restore-keys: siempre se restaura la ultima cache
+      # (aunque sea parcial) y se guarda una nueva solo si algo se construyo.
+      - name: Restaurar cache del toolchain ps3dev
         id: cache-ps3dev
         uses: actions/cache/restore@v4
         with:
           path: /usr/local/ps3dev
-          key: ps3dev-ubuntu2204-v2
+          key: ps3dev-ubuntu2204-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ps3dev-ubuntu2204-v3-
+            ps3dev-ubuntu2204-v2
+            ps3dev-
 
-      - name: Construir toolchain ps3dev (solo si no hay caché)
-        if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+      - name: Construir toolchain ps3dev (si falta)
         run: |
-          sudo mkdir -p /usr/local/ps3dev
-          sudo chown -R "$USER" /usr/local/ps3dev
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
+          if [ -x "$PS3DEV/ppu/bin/powerpc64-ps3-elf-gcc" ] \
+             && [ -x "$PS3DEV/bin/cgcomp" ] \
+             && [ -f "$PSL1GHT/ppu/include/rsx/rsx.h" ]; then
+            echo "Toolchain ya presente (cache). Salto."
+            exit 0
+          fi
+          rm -rf ps3toolchain
           git clone --depth 1 https://github.com/ps3dev/ps3toolchain.git
           cd ps3toolchain
           ./toolchain.sh
+          echo "PS3DEV_DIRTY=true" >> "$GITHUB_ENV"
 
-      - name: Construir librerías de PS3 (zlib, libpng, libjpeg)
-        if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+      - name: Construir librerias de PS3 (zlib, libpng, libjpeg)
         run: |
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
           PORT="$PS3DEV/portlibs/ppu"
+          have_libs() {
+            [ -f "$PORT/lib/libz.a" ] && [ -f "$PORT/lib/libpng.a" ] && [ -f "$PORT/lib/libjpeg.a" ] \
+              && [ -f "$PORT/include/zlib.h" ] && [ -f "$PORT/include/png.h" ] && [ -f "$PORT/include/jpeglib.h" ]
+          }
+          if have_libs; then
+            echo "zlib/libpng/libjpeg ya presentes (cache). Salto."
+            exit 0
+          fi
+          rm -rf ps3libraries
           git clone --depth 1 https://github.com/ps3dev/ps3libraries.git
           cd ps3libraries
           echo "--- scripts disponibles ---"
           ls scripts depends 2>/dev/null | head -100
           mkdir -p build && cd build
-          # mismo método que libraries.sh: scripts ejecutados desde build/, en orden
+          # mismo metodo que libraries.sh: scripts ejecutados desde build/, en orden
           for pat in zlib png jpeg; do
             for f in $(ls ../scripts/*.sh ../depends/*.sh 2>/dev/null | grep -i "$pat" | sort); do
               echo "=== $f ==="
               bash "$f"
             done
           done
-          echo "--- resultado en $PORT/lib ---"
+          echo "--- resultado en $PORT ---"
           ls "$PORT/lib" "$PORT/include" | head -60
-          for l in libz.a libpng.a libjpeg.a; do
-            if [ ! -f "$PORT/lib/$l" ] && ! ls "$PORT/lib"/${l%.a}*.a >/dev/null 2>&1; then
-              echo "ERROR: falta $l en $PORT/lib"; exit 1
-            fi
-          done
-          for h in zlib.h png.h jpeglib.h; do
-            [ -f "$PORT/include/$h" ] || { echo "ERROR: falta $h en $PORT/include"; exit 1; }
-          done
+          have_libs || { echo "ERROR: faltan libz.a / libpng.a / libjpeg.a o sus headers en $PORT"; exit 1; }
+          echo "PS3DEV_DIRTY=true" >> "$GITHUB_ENV"
 
-      - name: Guardar caché del toolchain (aunque falle lo que sigue)
-        if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+      # Se guarda aunque falle algo posterior (cancelled() excluido), pero solo si
+      # este run construyo algo. Asi un error en Cg o en el juego no tira 1 h de toolchain.
+      - name: Guardar cache del toolchain
+        if: ${{ !cancelled() && env.PS3DEV_DIRTY == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: /usr/local/ps3dev
-          key: ps3dev-ubuntu2204-v2
+          key: ps3dev-ubuntu2204-v3-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Instalar Cg Toolkit (libCg para cgcomp)
         run: |
           set -x
           CGCOMP="$PS3DEV/bin/cgcomp"
+          [ -x "$CGCOMP" ] || { echo "ERROR: no existe $CGCOMP (el toolchain no instalo PSL1GHT)"; exit 1; }
           file "$CGCOMP" || true
-          sudo apt-get install -y file strace || true
-          # cgcomp hace dlopen("libCg.so"): hay que tener la libCg de la MISMA arquitectura (32 o 64 bits)
+          # cgcomp hace dlopen("libCg.so"): hace falta la libCg de la MISMA arquitectura (32 o 64 bits)
           if file "$CGCOMP" | grep -q "32-bit"; then
-            ARCH=ia32; TGZ=Cg-3.1_April2012_x86.tgz; LIBDIR=/usr/lib32
+            TGZ=Cg-3.1_April2012_x86.tgz
             sudo dpkg --add-architecture i386
             sudo apt-get update
             sudo apt-get install -y libc6:i386 libstdc++6:i386 || true
           else
-            ARCH=x86_64; TGZ=Cg-3.1_April2012_x86_64.tgz; LIBDIR=/usr/lib64
+            TGZ=Cg-3.1_April2012_x86_64.tgz
           fi
           wget --tries=3 -O cg.tgz "https://developer.download.nvidia.com/cg/Cg_3.1/$TGZ" || true
           if tar -tzf cg.tgz >/dev/null 2>&1; then
@@ -109,23 +140,25 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y nvidia-cg-toolkit
           fi
-          find / -name 'libCg.so*' 2>/dev/null
-          # copiar libCg.so a las rutas estándar donde dlopen busca sí o sí
+          find / -name 'libCg.so*' 2>/dev/null || true
           LIB=$(find /usr /opt -name 'libCg.so' 2>/dev/null | head -n 1)
           [ -n "$LIB" ] || { echo "ERROR: no hay libCg.so"; exit 1; }
+          # copiar libCg.so a las rutas estandar donde dlopen busca si o si
           for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib32 /usr/local/lib; do
-            [ -d "$d" ] && sudo cp -f "$LIB" "$d/libCg.so" || true
+            if [ -d "$d" ] && ! [ "$LIB" -ef "$d/libCg.so" ]; then sudo cp -f "$LIB" "$d/libCg.so" || true; fi
           done
           sudo ldconfig
-          echo "LD_LIBRARY_PATH=$(dirname "$LIB"):/usr/lib:/usr/lib64:/usr/lib32:/usr/local/lib" >> $GITHUB_ENV
+          LDP="$(dirname "$LIB"):/usr/lib:/usr/lib64:/usr/lib32:/usr/local/lib"
+          echo "LD_LIBRARY_PATH=$LDP" >> "$GITHUB_ENV"
           ldd "$LIB" || true
           # prueba real: compilar un shader antes de empezar el build
+          export LD_LIBRARY_PATH="$LDP"
           mkdir -p /tmp/cgtest
-          echo "--- prueba de cgcomp ---"
-          export LD_LIBRARY_PATH="$(dirname "$LIB"):/usr/lib:/usr/lib64:/usr/lib32:$LD_LIBRARY_PATH"
           F=$(find . -name 'ps3gl_fp_tex.fcg' | head -n 1)
+          [ -n "$F" ] || { echo "ERROR: no encuentro ps3gl_fp_tex.fcg en el repo"; exit 1; }
+          echo "--- prueba de cgcomp ---"
           "$CGCOMP" -f "$F" /tmp/cgtest/t.fpo || {
-            echo "cgcomp sigue fallando; trazando dlopen:"
+            echo "cgcomp fallo; trazando dlopen:"
             strace -f -e trace=openat "$CGCOMP" -f "$F" /tmp/cgtest/t.fpo 2>&1 | grep -i -E "libcg|ENOENT.*cg" || true
             exit 1
           }
@@ -135,20 +168,33 @@ jobs:
         run: |
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
           ls "$PS3DEV/bin" | head -50
-          which powerpc64-ps3-elf-gcc cgcomp make_self_npdrm sfo.py pkg.py fself.py || true
+          which powerpc64-ps3-elf-gcc cgcomp make_self_npdrm sfo.py pkg.py fself.py sprxlinker || true
+          powerpc64-ps3-elf-gcc --version | head -n 1
 
       - name: Compilar el juego
         run: |
           chmod +x ./*.sh
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          # pipefail viene de "shell: bash": si build_ps3.sh falla, este paso falla.
           ./build_ps3.sh clean 2>&1 | tee build.log
+          test -f build-ps3/pvz_ps3.elf
 
       - name: Empaquetar (.self y .pkg)
         run: |
           export PATH="$PATH:$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin"
           ./package_ps3.sh 2>&1 | tee package.log
-          ls -la build-ps3/package || true
+          ls -la build-ps3/package
+
+      # Muestra solo las primeras lineas de error de cada log: es lo que hay que pegar.
+      - name: Primeros errores (solo si falla)
+        if: failure()
+        run: |
+          for f in build.log package.log; do
+            [ -f "$f" ] || continue
+            echo "=============== $f ==============="
+            grep -n -i -m 20 -E "error|fatal|undefined reference|FAILED:|No such file|not found" "$f" || tail -n 40 "$f"
+          done
 
       - name: Subir resultado
         if: always()
@@ -160,7 +206,7 @@ jobs:
             build-ps3/package/*.self
             build-ps3/package/*.pkg
             build.log
+            package.log
             build-ps3/ps3gl_shaders/*
             build-ps3/.ninja_log
-            package.log
           if-no-files-found: warn
